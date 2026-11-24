@@ -58,8 +58,8 @@ type Content struct {
 	CreateTime string `json:"createTime"`
 	UpdateTime string `json:"updateTime"`
 	//CommentCount    int         `json:"commentCount"`
-	ThumbnailURL string `json:"thumbnailURL"`
-	//BigthumbnailURL string      `json:"bigthumbnailURL"`
+	ThumbnailURL    string `json:"thumbnailURL"`
+	BigthumbnailURL string `json:"bigthumbnailURL"`
 	//PresentURL      string      `json:"presentURL"`
 	//PresentLURL     string      `json:"presentLURL"`
 	//PresentHURL     string      `json:"presentHURL"`
@@ -143,6 +143,13 @@ type UploadResp struct {
 	} `json:"data"`
 }
 
+type InterLayerUploadResult struct {
+	XMLName    xml.Name `xml:"result"`
+	Text       string   `xml:",chardata"`
+	ResultCode int      `xml:"resultCode"`
+	Msg        string   `xml:"msg"`
+}
+
 type CloudContent struct {
 	ContentID string `json:"contentID"`
 	//Modifier         string      `json:"modifier"`
@@ -155,10 +162,10 @@ type CloudContent struct {
 	//ContentDesc      string      `json:"contentDesc"`
 	CreateTime string `json:"createTime"`
 	//Shottime         interface{} `json:"shottime"`
-	LastUpdateTime string `json:"lastUpdateTime"`
-	ThumbnailURL   string `json:"thumbnailURL"`
+	LastUpdateTime  string `json:"lastUpdateTime"`
+	ThumbnailURL    string `json:"thumbnailURL"`
+	BigthumbnailURL string `json:"bigthumbnailURL"`
 	//MidthumbnailURL  string      `json:"midthumbnailURL"`
-	//BigthumbnailURL  string      `json:"bigthumbnailURL"`
 	//PresentURL       string      `json:"presentURL"`
 	//PresentLURL      string      `json:"presentLURL"`
 	//PresentHURL      string      `json:"presentHURL"`
@@ -278,11 +285,68 @@ type PersonalUploadUrlResp struct {
 	}
 }
 
+type QueryRoutePolicyResp struct {
+	Success bool   `json:"success"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		RoutePolicyList []struct {
+			SiteID      string `json:"siteID"`
+			SiteCode    string `json:"siteCode"`
+			ModName     string `json:"modName"`
+			HttpUrl     string `json:"httpUrl"`
+			HttpsUrl    string `json:"httpsUrl"`
+			EnvID       string `json:"envID"`
+			ExtInfo     string `json:"extInfo"`
+			HashName    string `json:"hashName"`
+			ModAddrType int    `json:"modAddrType"`
+		} `json:"routePolicyList"`
+	} `json:"data"`
+}
+
 type RefreshTokenResp struct {
-	XMLName     xml.Name   `xml:"root"`
-	Return      string     `xml:"return"`
-	Token       string     `xml:"token"`
-	Expiretime  int32      `xml:"expiretime"`
-	AccessToken string     `xml:"accessToken"`
-	Desc        string     `xml:"desc"`
+	XMLName     xml.Name `xml:"root"`
+	Return      string   `xml:"return"`
+	Token       string   `xml:"token"`
+	Expiretime  int32    `xml:"expiretime"`
+	AccessToken string   `xml:"accessToken"`
+	Desc        string   `xml:"desc"`
+}
+
+type ShareCatalog struct {
+	CaID   string `json:"caID"`
+	CaName string `json:"caName"`
+	UdTime string `json:"udTime"`
+}
+
+type ShareContent struct {
+	CoID     string `json:"coID"`
+	CoName   string `json:"coName"`
+	CoSize   int64  `json:"coSize"`
+	CoType   int    `json:"coType"`
+	UdTime   string `json:"udTime"`
+	CoSuffix string `json:"coSuffix"`
+}
+
+type ShareListResp struct {
+	Data struct {
+		CaLst []ShareCatalog `json:"caLst"`
+		CoLst []ShareContent `json:"coLst"`
+	} `json:"data"`
+}
+
+type ShareLinkResp struct {
+	DownloadURL string `json:"downloadURL"`
+}
+type ShareContentInfo struct {
+	ContentName  string `json:"contentName"`
+	ContentSize  int64  `json:"contentSize"`
+	PresentURL   string `json:"presentURL"`   // HLS 播放地址
+	DownloadURL  string `json:"cdnDownLoadUrl"` // 真正的下载直链
+}
+
+type ShareContentInfoResp struct {
+	Data struct {
+		ContentInfo ShareContentInfo `json:"contentInfo"`
+	} `json:"data"`
 }

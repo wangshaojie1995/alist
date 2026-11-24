@@ -4,6 +4,8 @@ import (
 	"github.com/alist-org/alist/v3/cmd/flags"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/message"
+	"github.com/alist-org/alist/v3/internal/sign"
+	"github.com/alist-org/alist/v3/internal/stream"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server/common"
 	"github.com/alist-org/alist/v3/server/handles"
@@ -20,6 +22,7 @@ func Init(e *gin.Engine) {
 		})
 	}
 	Cors(e)
+	e.Use(middlewares.SessionRefresh)
 	g := e.Group(conf.URL.Path)
 	if conf.Conf.Scheme.HttpPort != -1 && conf.Conf.Scheme.HttpsPort != -1 && conf.Conf.Scheme.ForceHttps {
 		e.Use(middlewares.ForceHttps)
@@ -38,16 +41,29 @@ func Init(e *gin.Engine) {
 	WebDav(g.Group("/dav"))
 	S3(g.Group("/s3"))
 
-	g.GET("/d/*path", middlewares.Down, handles.Down)
-	g.GET("/p/*path", middlewares.Down, handles.Proxy)
-	g.HEAD("/d/*path", middlewares.Down, handles.Down)
-	g.HEAD("/p/*path", middlewares.Down, handles.Proxy)
-	g.GET("/ad/*path", middlewares.Down, handles.ArchiveDown)
-	g.GET("/ap/*path", middlewares.Down, handles.ArchiveProxy)
-	g.GET("/ae/*path", middlewares.Down, handles.ArchiveInternalExtract)
-	g.HEAD("/ad/*path", middlewares.Down, handles.ArchiveDown)
-	g.HEAD("/ap/*path", middlewares.Down, handles.ArchiveProxy)
-	g.HEAD("/ae/*path", middlewares.Down, handles.ArchiveInternalExtract)
+	downloadLimiter := middlewares.DownloadRateLimiter(stream.ClientDownloadLimit)
+	signCheck := middlewares.Down(sign.Verify)
+	g.GET("/d/*path", signCheck, downloadLimiter, handles.Down)
+	g.GET("/p/*path", signCheck, downloadLimiter, handles.Proxy)
+	g.HEAD("/d/*path", signCheck, handles.Down)
+	g.HEAD("/p/*path", signCheck, handles.Proxy)
+	g.GET("/s/:share_id", handles.GetSharePage)
+	g.GET("/s/:share_id/*path", handles.GetSharePage)
+	g.GET("/sd/:share_id", downloadLimiter, handles.ShareDown)
+	g.GET("/sd/:share_id/*path", downloadLimiter, handles.ShareDown)
+	g.HEAD("/sd/:share_id", handles.ShareDown)
+	g.HEAD("/sd/:share_id/*path", handles.ShareDown)
+	g.GET("/sp/:share_id", downloadLimiter, handles.ShareProxy)
+	g.GET("/sp/:share_id/*path", downloadLimiter, handles.ShareProxy)
+	g.HEAD("/sp/:share_id", handles.ShareProxy)
+	g.HEAD("/sp/:share_id/*path", handles.ShareProxy)
+	archiveSignCheck := middlewares.Down(sign.VerifyArchive)
+	g.GET("/ad/*path", archiveSignCheck, downloadLimiter, handles.ArchiveDown)
+	g.GET("/ap/*path", archiveSignCheck, downloadLimiter, handles.ArchiveProxy)
+	g.GET("/ae/*path", archiveSignCheck, downloadLimiter, handles.ArchiveInternalExtract)
+	g.HEAD("/ad/*path", archiveSignCheck, handles.ArchiveDown)
+	g.HEAD("/ap/*path", archiveSignCheck, handles.ArchiveProxy)
+	g.HEAD("/ae/*path", archiveSignCheck, handles.ArchiveInternalExtract)
 
 	api := g.Group("/api")
 	auth := api.Group("", middlewares.Auth)
@@ -56,6 +72,7 @@ func Init(e *gin.Engine) {
 	api.POST("/auth/login", handles.Login)
 	api.POST("/auth/login/hash", handles.LoginHash)
 	api.POST("/auth/login/ldap", handles.LoginLdap)
+	api.POST("/auth/register", handles.Register)
 	auth.GET("/me", handles.CurrentUser)
 	auth.POST("/me/update", handles.UpdateCurrent)
 	auth.GET("/me/sshkey/list", handles.ListMyPublicKey)
@@ -64,6 +81,8 @@ func Init(e *gin.Engine) {
 	auth.POST("/auth/2fa/generate", handles.Generate2FA)
 	auth.POST("/auth/2fa/verify", handles.Verify2FA)
 	auth.GET("/auth/logout", handles.LogOut)
+	auth.GET("/me/sessions", handles.ListMySessions)
+	auth.POST("/me/sessions/evict", handles.EvictMySession)
 
 	// auth
 	api.GET("/auth/sso", handles.SSOLoginRedirect)
@@ -72,10 +91,10 @@ func Init(e *gin.Engine) {
 	api.GET("/auth/sso_get_token", handles.SSOLoginCallback)
 
 	// webauthn
+	api.GET("/authn/webauthn_begin_login", handles.BeginAuthnLogin)
+	api.POST("/authn/webauthn_finish_login", handles.FinishAuthnLogin)
 	webauthn.GET("/webauthn_begin_registration", handles.BeginAuthnRegistration)
 	webauthn.POST("/webauthn_finish_registration", handles.FinishAuthnRegistration)
-	webauthn.GET("/webauthn_begin_login", handles.BeginAuthnLogin)
-	webauthn.POST("/webauthn_finish_login", handles.FinishAuthnLogin)
 	webauthn.POST("/delete_authn", handles.DeleteAuthnLogin)
 	webauthn.GET("/getcredentials", handles.GetAuthnCredentials)
 
@@ -84,9 +103,21 @@ func Init(e *gin.Engine) {
 	public.Any("/settings", handles.PublicSettings)
 	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
 	public.Any("/archive_extensions", handles.ArchiveExtensions)
+	public.GET("/share/info", handles.GetPublicShareInfo)
+	public.POST("/share/auth", handles.AuthPublicShare)
+	public.POST("/share/list", handles.ListPublicShare)
+	public.POST("/share/get", handles.GetPublicShare)
 
 	_fs(auth.Group("/fs"))
+	share := auth.Group("/share", middlewares.AuthNotGuest)
+	share.POST("/create", handles.CreateShare)
+	share.POST("/update", handles.UpdateShare)
+	share.POST("/disable", handles.DisableShare)
+	share.GET("/list", handles.ListShares)
+	share.POST("/delete", handles.DeleteShare)
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
+	_label(auth.Group("/label"))
+	_labelFileBinding(auth.Group("/label_file_binding"))
 	admin(auth.Group("/admin", middlewares.AuthAdmin))
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
@@ -115,6 +146,13 @@ func admin(g *gin.RouterGroup) {
 	user.GET("/sshkey/list", handles.ListPublicKeys)
 	user.POST("/sshkey/delete", handles.DeletePublicKey)
 
+	role := g.Group("/role")
+	role.GET("/list", handles.ListRoles)
+	role.GET("/get", handles.GetRole)
+	role.POST("/create", handles.CreateRole)
+	role.POST("/update", handles.UpdateRole)
+	role.POST("/delete", handles.DeleteRole)
+
 	storage := g.Group("/storage")
 	storage.GET("/list", handles.ListStorages)
 	storage.GET("/get", handles.GetStorage)
@@ -136,12 +174,18 @@ func admin(g *gin.RouterGroup) {
 	setting.POST("/save", handles.SaveSettings)
 	setting.POST("/delete", handles.DeleteSetting)
 	setting.POST("/reset_token", handles.ResetToken)
+	setting.POST("/set_token", handles.SetToken)
 	setting.POST("/set_aria2", handles.SetAria2)
 	setting.POST("/set_qbit", handles.SetQbittorrent)
 	setting.POST("/set_transmission", handles.SetTransmission)
 	setting.POST("/set_115", handles.Set115)
 	setting.POST("/set_pikpak", handles.SetPikPak)
 	setting.POST("/set_thunder", handles.SetThunder)
+	setting.POST("/set_guangyapan", handles.SetGuangYaPan)
+	setting.POST("/set_123_open", handles.SetOpen123)
+	setting.POST("/set_frp", handles.SetFRP)
+	setting.POST("/stop_frp", handles.StopFRP)
+	setting.GET("/frp_runtime", handles.GetFRPRuntime)
 
 	// retain /admin/task API to ensure compatibility with legacy automation scripts
 	_task(g.Group("/task"))
@@ -156,6 +200,23 @@ func admin(g *gin.RouterGroup) {
 	index.POST("/stop", middlewares.SearchIndex, handles.StopIndex)
 	index.POST("/clear", middlewares.SearchIndex, handles.ClearIndex)
 	index.GET("/progress", middlewares.SearchIndex, handles.GetProgress)
+
+	label := g.Group("/label")
+	label.POST("/create", handles.CreateLabel)
+	label.POST("/update", handles.UpdateLabel)
+	label.POST("/delete", handles.DeleteLabel)
+
+	labelFileBinding := g.Group("/label_file_binding")
+	labelFileBinding.GET("/list", handles.ListLabelFileBinding)
+	labelFileBinding.POST("/create", handles.CreateLabelFileBinDing)
+	labelFileBinding.POST("/create_batch", handles.CreateLabelFileBinDingBatch)
+	labelFileBinding.POST("/delete", handles.DelLabelByFileName)
+	labelFileBinding.POST("/restore", handles.RestoreLabelFileBinding)
+
+	session := g.Group("/session")
+	session.GET("/list", handles.ListSessions)
+	session.POST("/evict", handles.EvictSession)
+
 }
 
 func _fs(g *gin.RouterGroup) {
@@ -163,6 +224,7 @@ func _fs(g *gin.RouterGroup) {
 	g.Any("/search", middlewares.SearchIndex, handles.Search)
 	g.Any("/get", handles.FsGet)
 	g.Any("/other", handles.FsOther)
+	g.GET("/lark/export/download", handles.LarkExportDownload)
 	g.Any("/dirs", handles.FsDirs)
 	g.POST("/mkdir", handles.FsMkdir)
 	g.POST("/rename", handles.FsRename)
@@ -173,8 +235,9 @@ func _fs(g *gin.RouterGroup) {
 	g.POST("/copy", handles.FsCopy)
 	g.POST("/remove", handles.FsRemove)
 	g.POST("/remove_empty_directory", handles.FsRemoveEmptyDirectory)
-	g.PUT("/put", middlewares.FsUp, handles.FsStream)
-	g.PUT("/form", middlewares.FsUp, handles.FsForm)
+	uploadLimiter := middlewares.UploadRateLimiter(stream.ClientUploadLimit)
+	g.PUT("/put", middlewares.FsUp, uploadLimiter, handles.FsStream)
+	g.PUT("/form", middlewares.FsUp, uploadLimiter, handles.FsForm)
 	g.POST("/link", middlewares.AuthAdmin, handles.Link)
 	// g.POST("/add_aria2", handles.AddOfflineDownload)
 	// g.POST("/add_qbit", handles.AddQbittorrent)
@@ -188,6 +251,16 @@ func _fs(g *gin.RouterGroup) {
 
 func _task(g *gin.RouterGroup) {
 	handles.SetupTaskRoute(g)
+}
+
+func _label(g *gin.RouterGroup) {
+	g.GET("/list", handles.ListLabel)
+	g.GET("/get", handles.GetLabel)
+}
+
+func _labelFileBinding(g *gin.RouterGroup) {
+	g.GET("/get", handles.GetLabelByFileName)
+	g.GET("/get_file_by_label", handles.GetFileByLabel)
 }
 
 func Cors(r *gin.Engine) {

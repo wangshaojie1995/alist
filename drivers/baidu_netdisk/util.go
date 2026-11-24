@@ -72,13 +72,19 @@ func (d *BaiduNetdisk) request(furl string, method string, callback base.ReqCall
 		log.Debugf("[baidu_netdisk] req: %s, resp: %s", furl, res.String())
 		errno := utils.Json.Get(res.Body(), "errno").ToInt()
 		if errno != 0 {
-			if utils.SliceContains([]int{111, -6}, errno) {
-				log.Info("refreshing baidu_netdisk token.")
+			if utils.SliceContains([]int{111, -6, 20016}, errno) {
+				log.Info("[baidu_netdisk] refreshing baidu_netdisk token.")
 				err2 := d.refreshToken()
 				if err2 != nil {
 					return retry.Unrecoverable(err2)
 				}
 			}
+
+			if 31023 == errno && d.DownloadAPI == "crack_video" {
+				result = res.Body()
+				return nil
+			}
+
 			return fmt.Errorf("req: [%s] ,errno: %d, refer to https://pan.baidu.com/union/doc/", furl, errno)
 		}
 		result = res.Body()
@@ -131,12 +137,21 @@ func (d *BaiduNetdisk) getFiles(dir string) ([]File, error) {
 		if len(resp.List) == 0 {
 			break
 		}
-		res = append(res, resp.List...)
+
+		if d.OnlyListVideoFile {
+			for _, file := range resp.List {
+				if file.Isdir == 1 || file.Category == 1 {
+					res = append(res, file)
+				}
+			}
+		} else {
+			res = append(res, resp.List...)
+		}
 	}
 	return res, nil
 }
 
-func (d *BaiduNetdisk) linkOfficial(file model.Obj, args model.LinkArgs) (*model.Link, error) {
+func (d *BaiduNetdisk) linkOfficial(file model.Obj, _ model.LinkArgs) (*model.Link, error) {
 	var resp DownloadResp
 	params := map[string]string{
 		"method": "filemetas",
@@ -164,7 +179,7 @@ func (d *BaiduNetdisk) linkOfficial(file model.Obj, args model.LinkArgs) (*model
 	}, nil
 }
 
-func (d *BaiduNetdisk) linkCrack(file model.Obj, args model.LinkArgs) (*model.Link, error) {
+func (d *BaiduNetdisk) linkCrack(file model.Obj, _ model.LinkArgs) (*model.Link, error) {
 	var resp DownloadResp2
 	param := map[string]string{
 		"target": fmt.Sprintf("[\"%s\"]", file.GetPath()),
@@ -181,6 +196,34 @@ func (d *BaiduNetdisk) linkCrack(file model.Obj, args model.LinkArgs) (*model.Li
 
 	return &model.Link{
 		URL: resp.Info[0].Dlink,
+		Header: http.Header{
+			"User-Agent": []string{d.CustomCrackUA},
+		},
+	}, nil
+}
+
+func (d *BaiduNetdisk) linkCrackVideo(file model.Obj, _ model.LinkArgs) (*model.Link, error) {
+	param := map[string]string{
+		"type":       "VideoURL",
+		"path":       fmt.Sprintf("%s", file.GetPath()),
+		"fs_id":      file.GetID(),
+		"devuid":     "0%1",
+		"clienttype": "1",
+		"channel":    "android_15_25010PN30C_bd-netdisk_1523a",
+		"nom3u8":     "1",
+		"dlink":      "1",
+		"media":      "1",
+		"origin":     "dlna",
+	}
+	resp, err := d.request("https://pan.baidu.com/api/mediainfo", http.MethodGet, func(req *resty.Request) {
+		req.SetQueryParams(param)
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return &model.Link{
+		URL: utils.Json.Get(resp, "info", "dlink").ToString(),
 		Header: http.Header{
 			"User-Agent": []string{d.CustomCrackUA},
 		},
@@ -230,22 +273,149 @@ func joinTime(form map[string]string, ctime, mtime int64) {
 
 const (
 	DefaultSliceSize int64 = 4 * utils.MB
-	VipSliceSize           = 16 * utils.MB
-	SVipSliceSize          = 32 * utils.MB
+	VipSliceSize     int64 = 16 * utils.MB
+	SVipSliceSize    int64 = 32 * utils.MB
+
+	MaxSliceNum       = 2048 // 文档写的是 1024/没写 ，但实际测试是 2048
+	SliceStep   int64 = 1 * utils.MB
 )
 
-func (d *BaiduNetdisk) getSliceSize() int64 {
-	if d.CustomUploadPartSize != 0 {
-		return d.CustomUploadPartSize
-	}
-	switch d.vipType {
-	case 1:
-		return VipSliceSize
-	case 2:
-		return SVipSliceSize
-	default:
+func (d *BaiduNetdisk) getSliceSize(filesize int64) int64 {
+	// 非会员固定为 4MB
+	if d.vipType == 0 {
+		if d.CustomUploadPartSize != 0 {
+			log.Warnf("[baidu_netdisk] CustomUploadPartSize is not supported for non-vip user, use DefaultSliceSize")
+		}
+		if filesize > MaxSliceNum*DefaultSliceSize {
+			log.Warnf("[baidu_netdisk] File size(%d) is too large, may cause upload failure", filesize)
+		}
+
 		return DefaultSliceSize
 	}
+
+	if d.CustomUploadPartSize != 0 {
+		if d.CustomUploadPartSize < DefaultSliceSize {
+			log.Warnf("[baidu_netdisk] CustomUploadPartSize(%d) is less than DefaultSliceSize(%d), use DefaultSliceSize", d.CustomUploadPartSize, DefaultSliceSize)
+			return DefaultSliceSize
+		}
+
+		if d.vipType == 1 && d.CustomUploadPartSize > VipSliceSize {
+			log.Warnf("[baidu_netdisk] CustomUploadPartSize(%d) is greater than VipSliceSize(%d), use VipSliceSize", d.CustomUploadPartSize, VipSliceSize)
+			return VipSliceSize
+		}
+
+		if d.vipType == 2 && d.CustomUploadPartSize > SVipSliceSize {
+			log.Warnf("[baidu_netdisk] CustomUploadPartSize(%d) is greater than SVipSliceSize(%d), use SVipSliceSize", d.CustomUploadPartSize, SVipSliceSize)
+			return SVipSliceSize
+		}
+
+		return d.CustomUploadPartSize
+	}
+
+	maxSliceSize := DefaultSliceSize
+
+	switch d.vipType {
+	case 1:
+		maxSliceSize = VipSliceSize
+	case 2:
+		maxSliceSize = SVipSliceSize
+	}
+
+	// upload on low bandwidth
+	if d.LowBandwithUploadMode {
+		size := DefaultSliceSize
+
+		for size <= maxSliceSize {
+			if filesize <= MaxSliceNum*size {
+				return size
+			}
+
+			size += SliceStep
+		}
+	}
+
+	if filesize > MaxSliceNum*maxSliceSize {
+		log.Warnf("[baidu_netdisk] File size(%d) is too large, may cause upload failure", filesize)
+	}
+
+	return maxSliceSize
+}
+
+// getUploadUrl 从开放平台获取上传域名/地址，并发请求会被合并，结果会被缓存1h。
+// 如果获取失败，则返回 Upload API设置项。
+func (d *BaiduNetdisk) getUploadUrl(path, uploadId string) string {
+	if !d.UseDynamicUploadAPI {
+		return d.UploadAPI
+	}
+	getCachedUrlFunc := func() string {
+		d.uploadUrlMu.RLock()
+		defer d.uploadUrlMu.RUnlock()
+		if d.uploadUrl != "" && time.Since(d.uploadUrlUpdateTime) < UPLOAD_URL_EXPIRE_TIME {
+			return d.uploadUrl
+		}
+		return ""
+	}
+	// 检查地址缓存
+	if uploadUrl := getCachedUrlFunc(); uploadUrl != "" {
+		return uploadUrl
+	}
+
+	uploadUrlGetFunc := func() (string, error) {
+		// 双重检查缓存
+		if uploadUrl := getCachedUrlFunc(); uploadUrl != "" {
+			return uploadUrl, nil
+		}
+
+		uploadUrl, err := d.requestForUploadUrl(path, uploadId)
+		if err != nil {
+			return "", err
+		}
+
+		d.uploadUrlMu.Lock()
+		defer d.uploadUrlMu.Unlock()
+		d.uploadUrl = uploadUrl
+		d.uploadUrlUpdateTime = time.Now()
+		return uploadUrl, nil
+	}
+
+	uploadUrl, err, _ := d.uploadUrlG.Do("", uploadUrlGetFunc)
+	if err != nil {
+		fallback := d.UploadAPI
+		log.Warnf("[baidu_netdisk] get upload URL failed (%v), will use fallback URL: %s", err, fallback)
+		return fallback
+	}
+	return uploadUrl
+}
+
+// requestForUploadUrl 请求获取上传地址。
+// 实测此接口不需要认证，传method和upload_version就行，不过还是按文档规范调用。
+// https://pan.baidu.com/union/doc/Mlvw5hfnr
+func (d *BaiduNetdisk) requestForUploadUrl(path, uploadId string) (string, error) {
+	params := map[string]string{
+		"method":         "locateupload",
+		"appid":          "250528",
+		"path":           path,
+		"uploadid":       uploadId,
+		"upload_version": "2.0",
+	}
+	apiUrl := "https://d.pcs.baidu.com/rest/2.0/pcs/file"
+	var resp UploadServerResp
+	_, err := d.request(apiUrl, http.MethodGet, func(req *resty.Request) {
+		req.SetQueryParams(params)
+	}, &resp)
+	if err != nil {
+		return "", err
+	}
+	var uploadUrl string
+	if len(resp.Servers) > 0 {
+		uploadUrl = resp.Servers[0].Server
+	} else if len(resp.BakServers) > 0 {
+		uploadUrl = resp.BakServers[0].Server
+	}
+	if uploadUrl == "" {
+		return "", errors.New("upload URL is empty")
+	}
+	return uploadUrl, nil
 }
 
 // func encodeURIComponent(str string) string {

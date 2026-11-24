@@ -2,14 +2,12 @@ package _123
 
 import (
 	"context"
-	"crypto/md5"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
-	"github.com/alist-org/alist/v3/internal/stream"
-	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/stream"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -31,7 +30,8 @@ import (
 type Pan123 struct {
 	model.Storage
 	Addition
-	apiRateLimit sync.Map
+	apiRateLimit    sync.Map
+	safeBoxUnlocked sync.Map
 }
 
 func (d *Pan123) Config() driver.Config {
@@ -55,9 +55,26 @@ func (d *Pan123) Drop(ctx context.Context) error {
 }
 
 func (d *Pan123) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	if f, ok := dir.(File); ok && f.IsLock {
+		if err := d.unlockSafeBox(f.FileId); err != nil {
+			return nil, err
+		}
+	}
 	files, err := d.getFiles(ctx, dir.GetID(), dir.GetName())
 	if err != nil {
-		return nil, err
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "safe box") || strings.Contains(err.Error(), "保险箱") {
+			if id, e := strconv.ParseInt(dir.GetID(), 10, 64); e == nil {
+				if e = d.unlockSafeBox(id); e == nil {
+					files, err = d.getFiles(ctx, dir.GetID(), dir.GetName())
+				} else {
+					return nil, e
+				}
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	return utils.SliceConvert(files, func(src File) (model.Obj, error) {
 		return src, nil
@@ -105,7 +122,7 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 		}
 		u_ := u.String()
 		log.Debug("download url: ", u_)
-		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://www.123pan.com/").Get(u_)
+		res, err := base.NoRedirectClient.R().SetHeader("Referer", "https://yun.123pan.com/").Get(u_)
 		if err != nil {
 			return nil, err
 		}
@@ -120,7 +137,7 @@ func (d *Pan123) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 			link.URL = utils.Json.Get(res.Body(), "data", "redirect_url").ToString()
 		}
 		link.Header = http.Header{
-			"Referer": []string{"https://www.123pan.com/"},
+			"Referer": []string{"https://yun.123pan.com/"},
 		}
 		return &link, nil
 	} else {
@@ -188,25 +205,12 @@ func (d *Pan123) Remove(ctx context.Context, obj model.Obj) error {
 
 func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
 	etag := file.GetHash().GetHash(utils.MD5)
+	var err error
 	if len(etag) < utils.MD5.Width {
-		// const DEFAULT int64 = 10485760
-		h := md5.New()
-		// need to calculate md5 of the full content
-		tempFile, err := file.CacheFullInTempFile()
+		_, etag, err = stream.CacheFullInTempFileAndHash(file, utils.MD5)
 		if err != nil {
 			return err
 		}
-		defer func() {
-			_ = tempFile.Close()
-		}()
-		if _, err = utils.CopyWithBuffer(h, tempFile); err != nil {
-			return err
-		}
-		_, err = tempFile.Seek(0, io.SeekStart)
-		if err != nil {
-			return err
-		}
-		etag = hex.EncodeToString(h.Sum(nil))
 	}
 	data := base.Json{
 		"driveId":      0,
@@ -249,10 +253,10 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 		input := &s3manager.UploadInput{
 			Bucket: &resp.Data.Bucket,
 			Key:    &resp.Data.Key,
-			Body: &stream.ReaderUpdatingProgress{
+			Body: driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
 				Reader:         file,
 				UpdateProgress: up,
-			},
+			}),
 		}
 		_, err = uploader.UploadWithContext(ctx, input)
 		if err != nil {

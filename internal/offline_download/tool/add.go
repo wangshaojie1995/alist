@@ -2,20 +2,22 @@ package tool
 
 import (
 	"context"
-	_115 "github.com/alist-org/alist/v3/drivers/115"
-	"github.com/alist-org/alist/v3/drivers/pikpak"
-	"github.com/alist-org/alist/v3/drivers/thunder"
-	"github.com/alist-org/alist/v3/internal/driver"
-	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/setting"
-	"github.com/alist-org/alist/v3/internal/task"
 	"net/url"
-	"path"
+	stdpath "path"
 	"path/filepath"
 
+	_115 "github.com/alist-org/alist/v3/drivers/115"
+	_123Open "github.com/alist-org/alist/v3/drivers/123_open"
+	"github.com/alist-org/alist/v3/drivers/guangyapan"
+	"github.com/alist-org/alist/v3/drivers/pikpak"
+	"github.com/alist-org/alist/v3/drivers/thunder"
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/errs"
+	"github.com/alist-org/alist/v3/internal/fs"
+	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/internal/setting"
+	"github.com/alist-org/alist/v3/internal/task"
 	"github.com/google/uuid"
 	"github.com/pkg/errors"
 )
@@ -59,8 +61,11 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 		}
 	}
 	// try putting url
-	if args.Tool == "SimpleHttp" && tryPutUrl(ctx, storage, dstDirActualPath, args.URL) {
-		return nil, nil
+	if args.Tool == "SimpleHttp" {
+		err = tryPutUrl(ctx, args.DstDirPath, args.URL)
+		if err == nil || !errors.Is(err, errs.NotImplement) {
+			return nil, err
+		}
 	}
 
 	// get tool
@@ -100,6 +105,26 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 		} else {
 			tempDir = filepath.Join(setting.GetStr(conf.ThunderTempDir), uid)
 		}
+	case Open123ToolName:
+		if _, ok := storage.(*_123Open.Open123); ok {
+			tempDir = args.DstDirPath
+		} else {
+			tempBase := setting.GetStr(conf.Open123TempDir)
+			if tempBase == "" {
+				return nil, errors.New("123 Open temp dir is not set")
+			}
+			tempDir = filepath.Join(tempBase, uid)
+		}
+	case "GuangYaPan":
+		if _, ok := storage.(*guangyapan.GuangYaPan); ok {
+			tempDir = args.DstDirPath
+		} else {
+			tempBase := setting.GetStr(conf.GuangYaPanTempDir)
+			if tempBase == "" {
+				return nil, errors.New("GuangYaPan temp dir is not set")
+			}
+			tempDir = filepath.Join(tempBase, uid)
+		}
 	}
 
 	taskCreator, _ := ctx.Value("user").(*model.User) // taskCreator is nil when convert failed
@@ -118,17 +143,13 @@ func AddURL(ctx context.Context, args *AddURLArgs) (task.TaskExtensionInfo, erro
 	return t, nil
 }
 
-func tryPutUrl(ctx context.Context, storage driver.Driver, dstDirActualPath, urlStr string) bool {
-	_, ok := storage.(driver.PutURL)
-	_, okResult := storage.(driver.PutURLResult)
-	if !ok && !okResult {
-		return false
-	}
+func tryPutUrl(ctx context.Context, path, urlStr string) error {
+	var dstName string
 	u, err := url.Parse(urlStr)
-	if err != nil {
-		return false
+	if err == nil {
+		dstName = stdpath.Base(u.Path)
+	} else {
+		dstName = "UnnamedURL"
 	}
-	dstName := path.Base(u.Path)
-	err = op.PutURL(ctx, storage, dstDirActualPath, dstName, urlStr)
-	return err == nil
+	return fs.PutURL(ctx, path, dstName, urlStr)
 }

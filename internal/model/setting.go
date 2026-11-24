@@ -12,6 +12,8 @@ const (
 	LDAP
 	S3
 	FTP
+	TRAFFIC
+	FRP
 )
 
 const (

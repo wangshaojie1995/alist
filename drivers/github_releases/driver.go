@@ -4,9 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
-
 	"strings"
+	"sync"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
@@ -18,7 +17,7 @@ type GithubReleases struct {
 	model.Storage
 	Addition
 
-	releases []Release
+	points []MountPoint
 }
 
 func (d *GithubReleases) Config() driver.Config {
@@ -30,86 +29,138 @@ func (d *GithubReleases) GetAddition() driver.Additional {
 }
 
 func (d *GithubReleases) Init(ctx context.Context) error {
-	SetHeader(d.Addition.Token)
-	repos, err := ParseRepos(d.Addition.RepoStructure, d.Addition.ShowAllVersion)
-	if err != nil {
-		return err
-	}
-	d.releases = repos
+	d.ParseRepos(d.Addition.RepoStructure)
 	return nil
 }
 
 func (d *GithubReleases) Drop(ctx context.Context) error {
-	ClearCache()
 	return nil
+}
+
+// processPoint 处理单个挂载点的文件列表
+func (d *GithubReleases) processPoint(point *MountPoint, path string, args model.ListArgs) []File {
+	var pointFiles []File
+
+	if !d.Addition.ShowAllVersion { // latest
+		point.RequestLatestRelease(d.GetRequest, args.Refresh)
+		pointFiles = d.processLatestVersion(point, path)
+	} else { // all version
+		point.RequestReleases(d.GetRequest, args.Refresh)
+		pointFiles = d.processAllVersions(point, path)
+	}
+
+	return pointFiles
+}
+
+// processLatestVersion 处理最新版本的逻辑
+func (d *GithubReleases) processLatestVersion(point *MountPoint, path string) []File {
+	var pointFiles []File
+
+	if point.Point == path { // 与仓库路径相同
+		pointFiles = append(pointFiles, point.GetLatestRelease()...)
+		if d.Addition.ShowReadme {
+			files := point.GetOtherFile(d.GetRequest, false)
+			pointFiles = append(pointFiles, files...)
+		}
+	} else if strings.HasPrefix(point.Point, path) { // 仓库目录的父目录
+		nextDir := GetNextDir(point.Point, path)
+		if nextDir != "" {
+			dirFile := File{
+				Path:     path + "/" + nextDir,
+				FileName: nextDir,
+				Size:     point.GetLatestSize(),
+				UpdateAt: point.Release.PublishedAt,
+				CreateAt: point.Release.CreatedAt,
+				Type:     "dir",
+				Url:      "",
+			}
+			pointFiles = append(pointFiles, dirFile)
+		}
+	}
+
+	return pointFiles
+}
+
+// processAllVersions 处理所有版本的逻辑
+func (d *GithubReleases) processAllVersions(point *MountPoint, path string) []File {
+	var pointFiles []File
+
+	if point.Point == path { // 与仓库路径相同
+		pointFiles = append(pointFiles, point.GetAllVersion()...)
+		if d.Addition.ShowReadme {
+			files := point.GetOtherFile(d.GetRequest, false)
+			pointFiles = append(pointFiles, files...)
+		}
+	} else if strings.HasPrefix(point.Point, path) { // 仓库目录的父目录
+		nextDir := GetNextDir(point.Point, path)
+		if nextDir != "" {
+			dirFile := File{
+				FileName: nextDir,
+				Path:     path + "/" + nextDir,
+				Size:     point.GetAllVersionSize(),
+				UpdateAt: (*point.Releases)[0].PublishedAt,
+				CreateAt: (*point.Releases)[0].CreatedAt,
+				Type:     "dir",
+				Url:      "",
+			}
+			pointFiles = append(pointFiles, dirFile)
+		}
+	} else if strings.HasPrefix(path, point.Point) { // 仓库目录的子目录
+		tagName := GetNextDir(path, point.Point)
+		if tagName != "" {
+			pointFiles = append(pointFiles, point.GetReleaseByTagName(tagName)...)
+		}
+	}
+
+	return pointFiles
+}
+
+// mergeFiles 合并文件列表，处理重复目录
+func (d *GithubReleases) mergeFiles(files *[]File, newFiles []File) {
+	for _, newFile := range newFiles {
+		if newFile.Type == "dir" {
+			hasSameDir := false
+			for index := range *files {
+				if (*files)[index].GetName() == newFile.GetName() && (*files)[index].Type == "dir" {
+					hasSameDir = true
+					(*files)[index].Size += newFile.Size
+					break
+				}
+			}
+			if !hasSameDir {
+				*files = append(*files, newFile)
+			}
+		} else {
+			*files = append(*files, newFile)
+		}
+	}
 }
 
 func (d *GithubReleases) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	files := make([]File, 0)
 	path := fmt.Sprintf("/%s", strings.Trim(dir.GetPath(), "/"))
 
-	for _, repo := range d.releases {
-		if repo.Path == path { // 与仓库路径相同
-			resp, err := GetRepoReleaseInfo(repo.RepoName, repo.ID, path, d.Storage.CacheExpiration)
-			if err != nil {
-				return nil, err
-			}
-			files = append(files, resp.Files...)
+	if d.Addition.ConcurrentRequests && d.Addition.Token != "" { // 并发处理
+		var mu sync.Mutex
+		var wg sync.WaitGroup
 
-			if d.Addition.ShowReadme {
-				resp, err := GetGithubOtherFile(repo.RepoName, path, d.Storage.CacheExpiration)
-				if err != nil {
-					return nil, err
-				}
-				files = append(files, *resp...)
-			}
+		for i := range d.points {
+			wg.Add(1)
+			go func(point *MountPoint) {
+				defer wg.Done()
+				pointFiles := d.processPoint(point, path, args)
 
-		} else if strings.HasPrefix(repo.Path, path) { // 仓库路径是目录的子目录
-			nextDir := GetNextDir(repo.Path, path)
-			if nextDir == "" {
-				continue
-			}
-			if d.Addition.ShowAllVersion {
-				files = append(files, File{
-					FileName: nextDir,
-					Size:     0,
-					CreateAt: time.Time{},
-					UpdateAt: time.Time{},
-					Url:      "",
-					Type:     "dir",
-					Path:     fmt.Sprintf("%s/%s", path, nextDir),
-				})
-				continue
-			}
-
-			repo, _ := GetRepoReleaseInfo(repo.RepoName, repo.Version, path, d.Storage.CacheExpiration)
-
-			hasSameDir := false
-			for index, file := range files {
-				if file.FileName == nextDir {
-					hasSameDir = true
-					files[index].Size += repo.Size
-					files[index].UpdateAt = func(a time.Time, b time.Time) time.Time {
-						if a.After(b) {
-							return a
-						}
-						return b
-					}(files[index].UpdateAt, repo.UpdateAt)
-					break
-				}
-			}
-
-			if !hasSameDir {
-				files = append(files, File{
-					FileName: nextDir,
-					Size:     repo.Size,
-					CreateAt: repo.CreateAt,
-					UpdateAt: repo.UpdateAt,
-					Url:      repo.Url,
-					Type:     "dir",
-					Path:     fmt.Sprintf("%s/%s", path, nextDir),
-				})
-			}
+				mu.Lock()
+				d.mergeFiles(&files, pointFiles)
+				mu.Unlock()
+			}(&d.points[i])
+		}
+		wg.Wait()
+	} else { // 串行处理
+		for i := range d.points {
+			point := &d.points[i]
+			pointFiles := d.processPoint(point, path, args)
+			d.mergeFiles(&files, pointFiles)
 		}
 	}
 
@@ -119,35 +170,41 @@ func (d *GithubReleases) List(ctx context.Context, dir model.Obj, args model.Lis
 }
 
 func (d *GithubReleases) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	url := file.GetID()
+	gh_proxy := strings.TrimSpace(d.Addition.GitHubProxy)
+
+	if gh_proxy != "" {
+		url = strings.Replace(url, "https://github.com", gh_proxy, 1)
+	}
+
 	link := model.Link{
-		URL:    file.GetID(),
+		URL:    url,
 		Header: http.Header{},
 	}
 	return &link, nil
 }
 
 func (d *GithubReleases) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
+	// TODO create folder, optional
 	return nil, errs.NotImplement
 }
 
 func (d *GithubReleases) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
+	// TODO move obj, optional
 	return nil, errs.NotImplement
 }
 
 func (d *GithubReleases) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
+	// TODO rename obj, optional
 	return nil, errs.NotImplement
 }
 
 func (d *GithubReleases) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
+	// TODO copy obj, optional
 	return nil, errs.NotImplement
 }
 
 func (d *GithubReleases) Remove(ctx context.Context, obj model.Obj) error {
+	// TODO remove obj, optional
 	return errs.NotImplement
 }
-
-func (d *GithubReleases) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	return nil, errs.NotImplement
-}
-
-var _ driver.Driver = (*GithubReleases)(nil)

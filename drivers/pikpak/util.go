@@ -7,16 +7,9 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
-	"github.com/alist-org/alist/v3/internal/driver"
-	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/op"
-	"github.com/alist-org/alist/v3/internal/stream"
-	"github.com/alist-org/alist/v3/pkg/utils"
-	"github.com/aliyun/aliyun-oss-go-sdk/oss"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/pkg/errors"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -25,38 +18,43 @@ import (
 	"time"
 
 	"github.com/alist-org/alist/v3/drivers/base"
+	"github.com/alist-org/alist/v3/internal/driver"
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/go-resty/resty/v2"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/pkg/errors"
 )
 
 var AndroidAlgorithms = []string{
-	"7xOq4Z8s",
-	"QE9/9+IQco",
-	"WdX5J9CPLZp",
-	"NmQ5qFAXqH3w984cYhMeC5TJR8j",
-	"cc44M+l7GDhav",
-	"KxGjo/wHB+Yx8Lf7kMP+/m9I+",
-	"wla81BUVSmDkctHDpUT",
-	"c6wMr1sm1WxiR3i8LDAm3W",
-	"hRLrEQCFNYi0PFPV",
-	"o1J41zIraDtJPNuhBu7Ifb/q3",
-	"U",
-	"RrbZvV0CTu3gaZJ56PVKki4IeP",
-	"NNuRbLckJqUp1Do0YlrKCUP",
-	"UUwnBbipMTvInA0U0E9",
-	"VzGc",
+	"SOP04dGzk0TNO7t7t9ekDbAmx+eq0OI1ovEx",
+	"nVBjhYiND4hZ2NCGyV5beamIr7k6ifAsAbl",
+	"Ddjpt5B/Cit6EDq2a6cXgxY9lkEIOw4yC1GDF28KrA",
+	"VVCogcmSNIVvgV6U+AochorydiSymi68YVNGiz",
+	"u5ujk5sM62gpJOsB/1Gu/zsfgfZO",
+	"dXYIiBOAHZgzSruaQ2Nhrqc2im",
+	"z5jUTBSIpBN9g4qSJGlidNAutX6",
+	"KJE2oveZ34du/g1tiimm",
 }
 
 var WebAlgorithms = []string{
-	"fyZ4+p77W1U4zcWBUwefAIFhFxvADWtT1wzolCxhg9q7etmGUjXr",
-	"uSUX02HYJ1IkyLdhINEFcCf7l2",
-	"iWt97bqD/qvjIaPXB2Ja5rsBWtQtBZZmaHH2rMR41",
-	"3binT1s/5a1pu3fGsN",
-	"8YCCU+AIr7pg+yd7CkQEY16lDMwi8Rh4WNp5",
-	"DYS3StqnAEKdGddRP8CJrxUSFh",
-	"crquW+4",
-	"ryKqvW9B9hly+JAymXCIfag5Z",
-	"Hr08T/NDTX1oSJfHk90c",
-	"i",
+	"C9qPpZLN8ucRTaTiUMWYS9cQvWOE",
+	"+r6CQVxjzJV6LCV",
+	"F",
+	"pFJRC",
+	"9WXYIDGrwTCz2OiVlgZa90qpECPD6olt",
+	"/750aCr4lm/Sly/c",
+	"RB+DT/gZCrbV",
+	"",
+	"CyLsf7hdkIRxRm215hl",
+	"7xHvLi2tOYP0Y92b",
+	"ZGTXXxu8E/MIWaEDB+Sm/",
+	"1UI3",
+	"E7fP5Pfijd+7K+t6Tg/NhuLq0eEUVChpJSkrKxpO",
+	"ihtqpG6FMt65+Xk+tWUH2",
+	"NhXXU9rg4XXdzo7u5o",
 }
 
 var PCAlgorithms = []string{
@@ -81,20 +79,108 @@ const (
 const (
 	AndroidClientID      = "YNxT9w7GMdWvEOKa"
 	AndroidClientSecret  = "dbw2OtmVEeuUvIptb1Coyg"
-	AndroidClientVersion = "1.49.3"
+	AndroidClientVersion = "1.53.2"
 	AndroidPackageName   = "com.pikcloud.pikpak"
-	AndroidSdkVersion    = "2.0.4.204101"
+	AndroidSdkVersion    = "2.0.6.206003"
 	WebClientID          = "YUMx5nI8ZU8Ap8pm"
 	WebClientSecret      = "dbw2OtmVEeuUvIptb1Coyg"
-	WebClientVersion     = "undefined"
-	WebPackageName       = "drive.mypikpak.com"
+	WebClientVersion     = "2.0.0"
+	WebPackageName       = "mypikpak.com"
 	WebSdkVersion        = "8.0.3"
 	PCClientID           = "YvtoWO6GNHiuCl7x"
 	PCClientSecret       = "1NIH5R1IEe2pAxZE3hv3uA"
-	PCClientVersion      = "undefined" // 2.5.6.4831
+	PCClientVersion      = "undefined" // 2.6.11.4955
 	PCPackageName        = "mypikpak.com"
 	PCSdkVersion         = "8.0.3"
 )
+
+// defaultPikPakDomain is the API domain used when api_domain is left empty.
+const defaultPikPakDomain = "mypikpak.net"
+
+// pikPakDomains is the list of known PikPak domains whose host can be swapped
+// on download/play links. See issue #9559.
+var pikPakDomains = []string{"mypikpak.com", "mypikpak.net", "pikpak.me", "pikpakdrive.com"}
+
+// domainOptionMap maps the built-in select option keys (which avoid dots so the
+// web UI renders readable labels) to the real domains.
+var domainOptionMap = map[string]string{
+	"mypikpak_net":    "mypikpak.net",
+	"mypikpak_com":    "mypikpak.com",
+	"pikpak_me":       "pikpak.me",
+	"pikpakdrive_com": "pikpakdrive.com",
+}
+
+// resolveDomainOption turns a built-in option key into its real domain, while
+// passing through any value already in domain form (manual entry / legacy).
+func resolveDomainOption(v string) string {
+	if domain, ok := domainOptionMap[v]; ok {
+		return domain
+	}
+	return v
+}
+
+// getApiDomain returns the API domain to use: the manually entered
+// custom_api_domain takes precedence over the selected api_domain, and falls
+// back to the default when both are empty.
+func (d *PikPak) getApiDomain() string {
+	if domain := strings.TrimSpace(d.CustomApiDomain); domain != "" {
+		return domain
+	}
+	if domain := strings.TrimSpace(d.ApiDomain); domain != "" {
+		return resolveDomainOption(domain)
+	}
+	return defaultPikPakDomain
+}
+
+// getDownloadDomain returns the domain that download/play links should be
+// rewritten to, or "" when links should be kept unchanged. The manually
+// entered custom_download_domain takes precedence over the selected
+// download_domain; the sentinel "original" means "do not rewrite".
+func (d *PikPak) getDownloadDomain() string {
+	if domain := strings.TrimSpace(d.CustomDownloadDomain); domain != "" {
+		return domain
+	}
+	if domain := strings.TrimSpace(d.DownloadDomain); domain != "" && domain != "original" {
+		return resolveDomainOption(domain)
+	}
+	return ""
+}
+
+// apiURL builds an api-drive.<domain> URL for the given path (path starts with "/").
+func (d *PikPak) apiURL(path string) string {
+	return "https://api-drive." + d.getApiDomain() + path
+}
+
+// userURL builds a user.<domain> URL for the given path (path starts with "/").
+func (d *PikPak) userURL(path string) string {
+	return "https://user." + d.getApiDomain() + path
+}
+
+// rewriteDownloadURL rewrites the host of a download/play link to the configured
+// download_domain, keeping the original subdomain prefix (e.g. dl-a.mypikpak.com
+// -> dl-a.mypikpak.net). It is a no-op when download_domain is empty or the link
+// host is not a known PikPak domain.
+func (d *PikPak) rewriteDownloadURL(rawURL string) string {
+	domain := d.getDownloadDomain()
+	if domain == "" || rawURL == "" {
+		return rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	for _, base := range pikPakDomains {
+		if u.Host == base {
+			u.Host = domain
+			return u.String()
+		}
+		if strings.HasSuffix(u.Host, "."+base) {
+			u.Host = strings.TrimSuffix(u.Host, base) + domain
+			return u.String()
+		}
+	}
+	return rawURL
+}
 
 func (d *PikPak) login() error {
 	// 检查用户名和密码是否为空
@@ -102,7 +188,7 @@ func (d *PikPak) login() error {
 		return errors.New("username or password is empty")
 	}
 
-	url := "https://user.mypikpak.net/v1/auth/signin"
+	url := d.userURL("/v1/auth/signin")
 	// 使用 用户填写的 CaptchaToken —————— (验证后的captcha_token)
 	if d.GetCaptchaToken() == "" {
 		if err := d.RefreshCaptchaTokenInLogin(GetAction(http.MethodPost, url), d.Username); err != nil {
@@ -132,7 +218,7 @@ func (d *PikPak) login() error {
 }
 
 func (d *PikPak) refreshToken(refreshToken string) error {
-	url := "https://user.mypikpak.net/v1/auth/token"
+	url := d.userURL("/v1/auth/token")
 	var e ErrResp
 	res, err := base.RestyClient.SetRetryCount(1).R().SetError(&e).
 		SetHeader("user-agent", "").SetBody(base.Json{
@@ -232,7 +318,7 @@ func (d *PikPak) getFiles(id string) ([]File, error) {
 			"page_token":     pageToken,
 		}
 		var resp Files
-		_, err := d.request("https://api-drive.mypikpak.net/drive/v1/files", http.MethodGet, func(req *resty.Request) {
+		_, err := d.request(d.apiURL("/drive/v1/files"), http.MethodGet, func(req *resty.Request) {
 			req.SetQueryParams(query)
 		}, &resp)
 		if err != nil {
@@ -397,7 +483,7 @@ func (d *PikPak) refreshCaptchaToken(action string, metas map[string]string) err
 	}
 	var e ErrResp
 	var resp CaptchaTokenResponse
-	_, err := d.request("https://user.mypikpak.net/v1/shield/captcha/init", http.MethodPost, func(req *resty.Request) {
+	_, err := d.request(d.userURL("/v1/shield/captcha/init"), http.MethodPost, func(req *resty.Request) {
 		req.SetError(&e).SetBody(param).SetQueryParam("client_id", d.ClientID)
 	}, &resp)
 
@@ -430,13 +516,10 @@ func (d *PikPak) UploadByOSS(ctx context.Context, params *S3Params, s model.File
 		return err
 	}
 
-	err = bucket.PutObject(params.Key, &stream.ReaderWithCtx{
-		Reader: &stream.ReaderUpdatingProgress{
-			Reader:         s,
-			UpdateProgress: up,
-		},
-		Ctx: ctx,
-	}, OssOption(params)...)
+	err = bucket.PutObject(params.Key, driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
+		Reader:         s,
+		UpdateProgress: up,
+	}), OssOption(params)...)
 	if err != nil {
 		return err
 	}
@@ -522,11 +605,8 @@ func (d *PikPak) UploadByMultipart(ctx context.Context, params *S3Params, fileSi
 						continue
 					}
 
-					b := bytes.NewBuffer(buf)
-					if part, err = bucket.UploadPart(imur, &stream.ReaderWithCtx{
-						Reader: b,
-						Ctx:    ctx,
-					}, chunk.Size, chunk.Number, OssOption(params)...); err == nil {
+					b := driver.NewLimitedUploadStream(ctx, bytes.NewReader(buf))
+					if part, err = bucket.UploadPart(imur, b, chunk.Size, chunk.Number, OssOption(params)...); err == nil {
 						break
 					}
 				}

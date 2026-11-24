@@ -1,32 +1,38 @@
 package iso9660
 
 import (
-	"github.com/alist-org/alist/v3/internal/archive/tool"
-	"github.com/alist-org/alist/v3/internal/errs"
-	"github.com/alist-org/alist/v3/internal/model"
-	"github.com/alist-org/alist/v3/internal/stream"
-	"github.com/kdomanski/iso9660"
 	"io"
 	"os"
-	stdpath "path"
+
+	"github.com/alist-org/alist/v3/internal/archive/tool"
+	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/errs"
+	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/setting"
+	"github.com/alist-org/alist/v3/internal/stream"
+	"github.com/kdomanski/iso9660"
 )
 
 type ISO9660 struct {
 }
 
-func (t *ISO9660) AcceptedExtensions() []string {
+func (ISO9660) AcceptedExtensions() []string {
 	return []string{".iso"}
 }
 
-func (t *ISO9660) GetMeta(ss *stream.SeekableStream, args model.ArchiveArgs) (model.ArchiveMeta, error) {
+func (ISO9660) AcceptedMultipartExtensions() map[string]tool.MultipartExtension {
+	return map[string]tool.MultipartExtension{}
+}
+
+func (ISO9660) GetMeta(ss []*stream.SeekableStream, args model.ArchiveArgs) (model.ArchiveMeta, error) {
 	return &model.ArchiveMetaInfo{
 		Comment:   "",
 		Encrypted: false,
 	}, nil
 }
 
-func (t *ISO9660) List(ss *stream.SeekableStream, args model.ArchiveInnerArgs) ([]model.Obj, error) {
-	img, err := getImage(ss)
+func (ISO9660) List(ss []*stream.SeekableStream, args model.ArchiveInnerArgs) ([]model.Obj, error) {
+	img, err := getImage(ss[0])
 	if err != nil {
 		return nil, err
 	}
@@ -48,8 +54,8 @@ func (t *ISO9660) List(ss *stream.SeekableStream, args model.ArchiveInnerArgs) (
 	return ret, nil
 }
 
-func (t *ISO9660) Extract(ss *stream.SeekableStream, args model.ArchiveInnerArgs) (io.ReadCloser, int64, error) {
-	img, err := getImage(ss)
+func (ISO9660) Extract(ss []*stream.SeekableStream, args model.ArchiveInnerArgs) (io.ReadCloser, int64, error) {
+	img, err := getImage(ss[0])
 	if err != nil {
 		return nil, 0, err
 	}
@@ -63,8 +69,8 @@ func (t *ISO9660) Extract(ss *stream.SeekableStream, args model.ArchiveInnerArgs
 	return io.NopCloser(obj.Reader()), obj.Size(), nil
 }
 
-func (t *ISO9660) Decompress(ss *stream.SeekableStream, outputPath string, args model.ArchiveInnerArgs, up model.UpdateProgress) error {
-	img, err := getImage(ss)
+func (ISO9660) Decompress(ss []*stream.SeekableStream, outputPath string, args model.ArchiveInnerArgs, up model.UpdateProgress) error {
+	img, err := getImage(ss[0])
 	if err != nil {
 		return err
 	}
@@ -72,19 +78,23 @@ func (t *ISO9660) Decompress(ss *stream.SeekableStream, outputPath string, args 
 	if err != nil {
 		return err
 	}
+	limiter := tool.NewSizeLimiter(int64(setting.GetInt(conf.MaxExtractSize, 0)) << 30)
 	if obj.IsDir() {
 		if args.InnerPath != "/" {
-			outputPath = stdpath.Join(outputPath, obj.Name())
+			outputPath, err = tool.SecureJoin(outputPath, obj.Name())
+			if err != nil {
+				return err
+			}
 			if err = os.MkdirAll(outputPath, 0700); err != nil {
 				return err
 			}
 		}
 		var children []*iso9660.File
 		if children, err = obj.GetChildren(); err == nil {
-			err = decompressAll(children, outputPath)
+			err = decompressAll(children, outputPath, limiter)
 		}
 	} else {
-		err = decompress(obj, outputPath, up)
+		err = decompress(obj, outputPath, up, limiter)
 	}
 	return err
 }
@@ -92,5 +102,5 @@ func (t *ISO9660) Decompress(ss *stream.SeekableStream, outputPath string, args 
 var _ tool.Tool = (*ISO9660)(nil)
 
 func init() {
-	tool.RegisterTool(&ISO9660{})
+	tool.RegisterTool(ISO9660{})
 }

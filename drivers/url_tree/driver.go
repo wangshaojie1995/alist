@@ -3,14 +3,17 @@ package url_tree
 import (
 	"context"
 	"errors"
-	"github.com/alist-org/alist/v3/internal/op"
+	"fmt"
+	"net/url"
 	stdpath "path"
 	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	log "github.com/sirupsen/logrus"
 )
@@ -18,8 +21,9 @@ import (
 type Urls struct {
 	model.Storage
 	Addition
-	root  *Node
-	mutex sync.RWMutex
+	root               *Node
+	mutex              sync.RWMutex
+	downloadParamsTmpl *template.Template
 }
 
 func (d *Urls) Config() driver.Config {
@@ -37,6 +41,14 @@ func (d *Urls) Init(ctx context.Context) error {
 	}
 	node.calSize()
 	d.root = node
+	d.downloadParamsTmpl = nil
+	if params := strings.TrimSpace(d.DownloadParams); params != "" {
+		tmpl, err := template.New("downloadParams").Parse(params)
+		if err != nil {
+			return fmt.Errorf("failed to parse download_params: %w", err)
+		}
+		d.downloadParamsTmpl = tmpl
+	}
 	return nil
 }
 
@@ -76,11 +88,47 @@ func (d *Urls) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*
 		return nil, errs.ObjectNotFound
 	}
 	if node.isFile() {
+		downURL := node.Url
+		// Append custom download parameters on download, but keep preview links clean.
+		if args.Type != "preview" && d.downloadParamsTmpl != nil {
+			var err error
+			downURL, err = d.buildDownloadURL(node, file.GetPath())
+			if err != nil {
+				return nil, err
+			}
+		}
 		return &model.Link{
-			URL: node.Url,
+			URL: downURL,
 		}, nil
 	}
 	return nil, errs.NotFile
+}
+
+// buildDownloadURL renders the configured download_params template with the
+// node's magic variables and appends the result as query parameters to the URL.
+func (d *Urls) buildDownloadURL(node *Node, path string) (string, error) {
+	var sb strings.Builder
+	err := d.downloadParamsTmpl.Execute(&sb, map[string]interface{}{
+		"Name":     node.Name,
+		"Path":     path,
+		"Size":     node.Size,
+		"Modified": node.Modified,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to render download_params: %w", err)
+	}
+	rendered := strings.TrimSpace(sb.String())
+	rendered = strings.TrimPrefix(rendered, "?")
+	if rendered == "" {
+		return node.Url, nil
+	}
+	// Parse the rendered string so that magic-variable values (e.g. file names
+	// with non-ASCII characters) are properly URL-encoded by Encode().
+	query, err := url.ParseQuery(rendered)
+	if err != nil {
+		return "", fmt.Errorf("invalid download_params %q: %w", rendered, err)
+	}
+	return utils.InjectQuery(node.Url, query)
 }
 
 func (d *Urls) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
@@ -243,7 +291,25 @@ func (d *Urls) PutURL(ctx context.Context, dstDir model.Obj, name, url string) (
 }
 
 func (d *Urls) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	return errs.UploadNotSupported
+	if !d.Writable {
+		return errs.PermissionDenied
+	}
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	node := GetNodeFromRootByPath(d.root, dstDir.GetPath()) // parent
+	if node == nil {
+		return errs.ObjectNotFound
+	}
+	if node.isFile() {
+		return errs.NotFolder
+	}
+	file, err := parseFileLine(stream.GetName(), d.HeadSize)
+	if err != nil {
+		return err
+	}
+	node.Children = append(node.Children, file)
+	d.updateStorage()
+	return nil
 }
 
 func (d *Urls) updateStorage() {

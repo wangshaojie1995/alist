@@ -1,10 +1,11 @@
 package handles
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/alist-org/alist/v3/internal/task"
 	"net/url"
 	stdpath "path"
-	"strings"
 
 	"github.com/alist-org/alist/v3/internal/archive/tool"
 	"github.com/alist-org/alist/v3/internal/conf"
@@ -39,21 +40,23 @@ type ArchiveMetaResp struct {
 
 type ArchiveContentResp struct {
 	ObjResp
-	Children []ArchiveContentResp `json:"children,omitempty"`
+	Children []ArchiveContentResp `json:"children"`
 }
 
 func toObjsRespWithoutSignAndThumb(obj model.Obj) ObjResp {
+	storageClass, _ := model.GetStorageClass(obj)
 	return ObjResp{
-		Name:        obj.GetName(),
-		Size:        obj.GetSize(),
-		IsDir:       obj.IsDir(),
-		Modified:    obj.ModTime(),
-		Created:     obj.CreateTime(),
-		HashInfoStr: obj.GetHash().String(),
-		HashInfo:    obj.GetHash().Export(),
-		Sign:        "",
-		Thumb:       "",
-		Type:        utils.GetObjType(obj.GetName(), obj.IsDir()),
+		Name:         obj.GetName(),
+		Size:         obj.GetSize(),
+		IsDir:        obj.IsDir(),
+		Modified:     obj.ModTime(),
+		Created:      obj.CreateTime(),
+		HashInfoStr:  obj.GetHash().String(),
+		HashInfo:     obj.GetHash().Export(),
+		Sign:         "",
+		Thumb:        "",
+		Type:         utils.GetObjType(obj.GetName(), obj.IsDir()),
+		StorageClass: storageClass,
 	}
 }
 
@@ -77,13 +80,18 @@ func FsArchiveMeta(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanReadArchives() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	reqPath, err := user.JoinPath(req.Path)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
+		return
+	}
+	if !common.CheckPathLimitWithRoles(user, reqPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, reqPath)
+	if !common.HasPermission(perm, common.PermReadArchives) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
 	meta, err := op.GetNearestMeta(reqPath)
@@ -120,7 +128,7 @@ func FsArchiveMeta(c *gin.Context) {
 	}
 	s := ""
 	if isEncrypt(meta, reqPath) || setting.GetBool(conf.SignAll) {
-		s = sign.Sign(reqPath)
+		s = sign.SignArchive(reqPath)
 	}
 	api := "/ae"
 	if ret.DriverProviding {
@@ -155,13 +163,18 @@ func FsArchiveList(c *gin.Context) {
 	}
 	req.Validate()
 	user := c.MustGet("user").(*model.User)
-	if !user.CanReadArchives() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	reqPath, err := user.JoinPath(req.Path)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
+		return
+	}
+	if !common.CheckPathLimitWithRoles(user, reqPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, reqPath)
+	if !common.HasPermission(perm, common.PermReadArchives) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
 	meta, err := op.GetNearestMeta(reqPath)
@@ -208,14 +221,30 @@ func FsArchiveList(c *gin.Context) {
 	})
 }
 
+type StringOrArray []string
+
+func (s *StringOrArray) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err == nil {
+		*s = []string{value}
+		return nil
+	}
+	var sliceValue []string
+	if err := json.Unmarshal(data, &sliceValue); err != nil {
+		return err
+	}
+	*s = sliceValue
+	return nil
+}
+
 type ArchiveDecompressReq struct {
-	SrcDir        string `json:"src_dir" form:"src_dir"`
-	DstDir        string `json:"dst_dir" form:"dst_dir"`
-	Name          string `json:"name" form:"name"`
-	ArchivePass   string `json:"archive_pass" form:"archive_pass"`
-	InnerPath     string `json:"inner_path" form:"inner_path"`
-	CacheFull     bool   `json:"cache_full" form:"cache_full"`
-	PutIntoNewDir bool   `json:"put_into_new_dir" form:"put_into_new_dir"`
+	SrcDir        string        `json:"src_dir" form:"src_dir"`
+	DstDir        string        `json:"dst_dir" form:"dst_dir"`
+	Name          StringOrArray `json:"name" form:"name"`
+	ArchivePass   string        `json:"archive_pass" form:"archive_pass"`
+	InnerPath     string        `json:"inner_path" form:"inner_path"`
+	CacheFull     bool          `json:"cache_full" form:"cache_full"`
+	PutIntoNewDir bool          `json:"put_into_new_dir" form:"put_into_new_dir"`
 }
 
 func FsArchiveDecompress(c *gin.Context) {
@@ -225,45 +254,69 @@ func FsArchiveDecompress(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanDecompress() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
-	srcPath, err := user.JoinPath(stdpath.Join(req.SrcDir, req.Name))
+	srcDir, err := user.JoinPath(req.SrcDir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
+	}
+	srcPaths := make([]string, 0, len(req.Name))
+	for _, name := range req.Name {
+		srcPath, err := utils.JoinUnderBase(srcDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		if !common.CheckPathLimitWithRoles(user, srcPath) {
+			common.ErrorResp(c, errs.PermissionDenied, 403)
+			return
+		}
+		srcPaths = append(srcPaths, srcPath)
 	}
 	dstDir, err := user.JoinPath(req.DstDir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
 	}
-	t, err := fs.ArchiveDecompress(c, srcPath, dstDir, model.ArchiveDecompressArgs{
-		ArchiveInnerArgs: model.ArchiveInnerArgs{
-			ArchiveArgs: model.ArchiveArgs{
-				LinkArgs: model.LinkArgs{
-					Header:  c.Request.Header,
-					Type:    c.Query("type"),
-					HttpReq: c.Request,
-				},
-				Password: req.ArchivePass,
-			},
-			InnerPath: utils.FixAndCleanPath(req.InnerPath),
-		},
-		CacheFull:     req.CacheFull,
-		PutIntoNewDir: req.PutIntoNewDir,
-	})
-	if err != nil {
-		if errors.Is(err, errs.WrongArchivePassword) {
-			common.ErrorResp(c, err, 202)
-		} else {
-			common.ErrorResp(c, err, 500)
-		}
+	if !common.CheckPathLimitWithRoles(user, dstDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
+	tasks := make([]task.TaskExtensionInfo, 0, len(srcPaths))
+	for _, srcPath := range srcPaths {
+		perm := common.MergeRolePermissions(user, srcPath)
+		if !common.HasPermission(perm, common.PermDecompress) {
+			common.ErrorResp(c, errs.PermissionDenied, 403)
+			return
+		}
+		t, e := fs.ArchiveDecompress(c, srcPath, dstDir, model.ArchiveDecompressArgs{
+			ArchiveInnerArgs: model.ArchiveInnerArgs{
+				ArchiveArgs: model.ArchiveArgs{
+					LinkArgs: model.LinkArgs{
+						Header:  c.Request.Header,
+						Type:    c.Query("type"),
+						HttpReq: c.Request,
+					},
+					Password: req.ArchivePass,
+				},
+				InnerPath: utils.FixAndCleanPath(req.InnerPath),
+			},
+			CacheFull:     req.CacheFull,
+			PutIntoNewDir: req.PutIntoNewDir,
+		})
+		if e != nil {
+			if errors.Is(e, errs.WrongArchivePassword) {
+				common.ErrorResp(c, e, 202)
+			} else {
+				common.ErrorResp(c, e, 500)
+			}
+			return
+		}
+		if t != nil {
+			tasks = append(tasks, t)
+		}
+	}
 	common.SuccessResp(c, gin.H{
-		"task": getTaskInfo(t),
+		"task": getTaskInfos(tasks),
 	})
 }
 
@@ -376,7 +429,7 @@ func ArchiveInternalExtract(c *gin.Context) {
 func ArchiveExtensions(c *gin.Context) {
 	var ext []string
 	for key := range tool.Tools {
-		ext = append(ext, strings.TrimPrefix(key, "."))
+		ext = append(ext, key)
 	}
 	common.SuccessResp(c, ext)
 }
